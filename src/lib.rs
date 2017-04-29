@@ -28,6 +28,7 @@ mod start_send_all;
 mod start_send_all_string;
 mod log;
 mod lock_free;
+mod i2c;
 
 use stm32f4::{rcc, gpio, usart, timer, nvic};
 use stm32f4::rcc::RCC;
