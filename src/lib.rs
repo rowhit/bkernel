@@ -36,11 +36,16 @@ use stm32f4::gpio::GPIO_B;
 use stm32f4::usart::USART1;
 use stm32f4::timer::TIM2;
 
-use futures::Future;
+use futures::{Future, Sink};
+use futures::future;
 
 use start_send_all_string::StartSendAllString;
 
 pub use log::__isr_usart1;
+pub use dev::i2c::{
+    __isr_i2c1_ev,
+    __isr_i2c1_er,
+};
 
 use breactor::Reactor;
 
@@ -78,6 +83,28 @@ pub extern fn kmain() -> ! {
     let stdin = unsafe {&mut log::STDIN};
     let stdout = unsafe {&mut log::STDOUT};
 
+    const BUF: [u8; 1] = [0xFE];
+
+fn delay(a: u32) {
+    unsafe {
+        let i: ::stm32f4::volatile::RW<u32> = ::core::mem::uninitialized();
+        i.set(a);
+        while i.get() > 0 {
+            i.update(|x| x - 1);
+        }
+    }
+}
+    let mut i2c_task = future::lazy(|| {
+        delay(500000);
+
+        (&::dev::i2c::I2C1_BUS).start_send(
+            ::dev::i2c::I2cTransaction::master_transmitter(
+                0x80, &BUF as *const u8, 1))
+            .and_then(|_| {
+                Ok(())
+            })
+    });
+
     let mut terminal = StartSendAllString::new(
         stdout,
         "\r\nWelcome to bkernel!\r\nType 'help' to get a list of available commands.\r\n"
@@ -87,6 +114,11 @@ pub extern fn kmain() -> ! {
 
     unsafe {
         let reactor = &REACTOR;
+
+        reactor.add_task(
+            2,
+            ::core::mem::transmute::<&mut Future<Item=(), Error=()>,
+                                     &'static mut Future<Item=(), Error=()>>(&mut i2c_task));
 
         reactor.add_task(
             5,
@@ -190,6 +222,44 @@ unsafe fn init_usart1() {
     });
 }
 
+unsafe fn init_i2c() {
+    use stm32f4::i2c;
+
+    RCC.apb1_clock_enable(rcc::Apb1Enable::I2C1);
+
+    // SCK
+    GPIO_B.enable(8, gpio::GpioConfig {
+        mode: gpio::GpioMode::AF,
+        ospeed: gpio::GpioOSpeed::FAST_SPEED,
+        otype: gpio::GpioOType::PUSH_PULL,
+        pupd: gpio::GpioPuPd::PULL_UP,
+        af: gpio::GpioAF::AF4,
+    });
+    // SDA
+    GPIO_B.enable(9, gpio::GpioConfig {
+        mode: gpio::GpioMode::AF,
+        ospeed: gpio::GpioOSpeed::FAST_SPEED,
+        otype: gpio::GpioOType::OPEN_DRAIN,
+        pupd: gpio::GpioPuPd::PULL_UP,
+        af: gpio::GpioAF::AF4,
+    });
+
+    i2c::I2C1.init(&i2c::I2C_INIT);
+
+    nvic::init(&nvic::NvicInit {
+        irq_channel: nvic::IrqChannel::I2C1_EV,
+        priority: 0,
+        subpriority: 2,
+        enable: true,
+    });
+    nvic::init(&nvic::NvicInit {
+        irq_channel: nvic::IrqChannel::I2C1_ER,
+        priority: 0,
+        subpriority: 2,
+        enable: true,
+    });
+}
+
 #[cfg(target_os = "none")]
 pub mod panicking {
     use core::fmt::{self, Write};
@@ -197,6 +267,8 @@ pub mod panicking {
 
     #[lang = "panic_fmt"]
     extern fn panic_fmt(fmt: fmt::Arguments, file: &str, line: u32) -> ! {
+        let _lock = unsafe { ::stm32f4::IrqLock::new() };
+
         let _ = write!(unsafe{&USART1}, "\r\nPANIC\r\n{}:{} {}", file, line, fmt);
         loop {
             unsafe { ::stm32f4::__wait_for_interrupt() };
@@ -218,10 +290,4 @@ pub unsafe extern fn __isr_tim2() {
             led::LD3.turn_off();
         }
     }
-}
-
-unsafe fn init_i2c() {
-    use stm32f4::i2c;
-
-    i2c::I2C1.init(&i2c::I2C_INIT);
 }
